@@ -16,9 +16,12 @@
   - [Cross-Cutting Concerns](#cross-cutting-concerns)
 - [Repository & Folder Structure](#repository--folder-structure)
 - [Frontend Codebase](#frontend-codebase)
-  - [UI Composition](#ui-composition)
-  - [State Management & Configuration](#state-management--configuration)
-  - [Data Flow & API Access](#data-flow--api-access)
+  - [Technology Primer](#technology-primer)
+  - [Application Shell & Context](#application-shell--context)
+  - [Page Routing](#page-routing)
+  - [Session Workspace Composition](#session-workspace-composition)
+  - [Chat Execution & WebSocket Loop](#chat-execution--websocket-loop)
+  - [API Client Bridges to FastAPI](#api-client-bridges-to-fastapi)
 - [Backend Codebase](#backend-codebase)
   - [FastAPI Service Layer](#fastapi-service-layer)
   - [Agent Orchestration](#agent-orchestration)
@@ -118,30 +121,275 @@ Magentic-UI is a research prototype that blends a human-centered interface with 
 
 ## Frontend Codebase
 
-### UI Composition
-The UI is composed of reusable layout primitives (`components/layout.tsx`) combined with feature-specific panels housed under `components/features`. Styling is driven by TailwindCSS, while Gatsby configures routing and static asset generation.
+### Technology Primer
+- **Framework:** Gatsby wraps a React + TypeScript single-page application, letting newcomers reason about the app as a standard React tree while benefiting from Gatsby’s build pipeline defined in `frontend/gatsby-config.ts`.
+- **Styling:** TailwindCSS utility classes (configured in `frontend/tailwind.config.js`) combine with Ant Design components for rapid UI assembly.
+- **State:** Zustand stores power both UI chrome preferences and agent session state, avoiding Redux boilerplate while remaining fully typed.
 
-### State Management & Configuration
-Zustand powers the global configuration store for agent behavior, exposing helper utilities for generating YAML-based overrides that mirror backend expectations.
+### Application Shell & Context
+The entire UI tree is wrapped by a provider that seeds default user metadata, dark-mode preference, and helper actions for later components.
 
-```tsx title="frontend/src/components/store.tsx"
-export const useSettingsStore = create<SettingsState>()((set) => ({
-  config: defaultConfig,
-  updateConfig: (update) =>
-    set((state) => ({
-      config: { ...state.config, ...update },
-    })),
-  resetToDefaults: () => set({ config: defaultConfig }),
-}));
+```tsx
+const Provider = ({ children }: any) => {
+  const storedValue = getLocalStorage("darkmode", false);
+  const [darkMode, setDarkMode] = useState(
+    storedValue === null ? "dark" : storedValue === "dark" ? "dark" : "light"
+  );
+  const logout = () => {
+    console.log("Please implement your own logout logic");
+    message.info("Please implement your own logout logic");
+  };
+  const updateDarkMode = (darkMode: string) => {
+    setDarkMode(darkMode);
+    setLocalStorage("darkmode", darkMode, false);
+  };
+  const initUser = {
+    name: "Guest User",
+    email: getLocalStorage("user_email") || "guestuser@gmail.com",
+    username: "guestuser",
+  };
+  const [userState, setUserState] = useState<IUser | null>(initUser);
+  return (
+    <appContext.Provider value={{ user: userState, setUser, logout, cookie_name, darkMode, setDarkMode: updateDarkMode }}>
+      {children}
+    </appContext.Provider>
+  );
+};
 ```
-*Source: `frontend/src/components/store.tsx`*
+*Source: `frontend/src/hooks/provider.tsx` (lines 27-84)*
 
-The store synchronizes user-selected defaults (e.g., approval policies, model providers) and emits serialized configuration via helper functions such as `generateOpenAIModelConfig` for quick copy/paste into YAML configs.
+The application shell supplied by Gatsby renders `MagenticUILayout`, which injects the `SessionManager` view and synchronizes appearance with the context.
 
-### Data Flow & API Access
-- **REST:** Gatsby pages call the `/api` namespace exposed by FastAPI for sessions, plans, settings, and validation.
-- **WebSockets:** Real-time status updates stream through `/api/ws`, enabling live session progress and browser playback.
-- **Authentication:** The open-source build relies on API keys configured in the backend; enterprise deployments can extend `signin.tsx` for custom auth flows.
+```tsx
+const MagenticUILayout = ({ title, link, restricted = false }: Props) => {
+  const { darkMode, user, setUser } = React.useContext(appContext);
+  const { sidebar } = useConfigStore();
+  React.useEffect(() => {
+    if (!user?.email) {
+      const defaultEmail = "default";
+      setUser({ ...user, email: defaultEmail, name: defaultEmail });
+      window.localStorage.setItem("user_email", defaultEmail);
+    }
+  }, [user, setUser]);
+  return (
+    <div className="h-screen flex">
+      <ConfigProvider theme={{ algorithm: darkMode === "dark" ? theme.darkAlgorithm : theme.defaultAlgorithm }}>
+        <main className="flex-1 p-1 text-primary" style={{ height: "100%" }}>
+          <SessionManager />
+        </main>
+      </ConfigProvider>
+    </div>
+  );
+};
+```
+*Source: `frontend/src/components/layout.tsx` (lines 23-108)*
+
+### Page Routing
+Gatsby’s file-system routing keeps onboarding simple: `pages/index.tsx` mounts the shared layout and forwards build-time metadata into `<head>` tags through Gatsby’s GraphQL query.
+
+```tsx
+const IndexPage = ({ data }: any) => {
+  return (
+    <MagenticUILayout meta={data.site.siteMetadata} title="Home" link={"/"}>
+      <main style={{ height: "100%" }} className="h-full" />
+    </MagenticUILayout>
+  );
+};
+
+export const query = graphql`
+  query HomePageQuery {
+    site {
+      siteMetadata {
+        description
+        title
+      }
+    }
+  }
+`;
+```
+*Source: `frontend/src/pages/index.tsx` (lines 1-26)*
+
+### Session Workspace Composition
+`SessionManager` orchestrates sidebar navigation, chat panes, and modal editors. New developers can trace the session lifecycle—list, create, select, and delete—within a single component.
+
+```tsx
+const fetchSessions = useCallback(async () => {
+  if (!user?.email) return;
+
+  try {
+    setIsLoading(true);
+    const data = await sessionAPI.listSessions(user.email);
+    setSessions(data);
+
+    const params = new URLSearchParams(window.location.search);
+    const sessionId = params.get("sessionId");
+    if (!session && data.length > 0 && !sessionId) {
+      setSession(data[0]);
+    } else {
+      if (data.length === 0) {
+        createDefaultSession();
+      }
+    }
+  } catch (error) {
+    console.error("Error fetching sessions:", error);
+    messageApi.error("Error loading sessions");
+  } finally {
+    setIsLoading(false);
+  }
+}, [user?.email, setSessions, session, setSession]);
+
+return (
+  <div className="relative flex flex-col h-full w-full">
+    {contextHolder}
+
+    <ContentHeader
+      isMobileMenuOpen={isMobileMenuOpen}
+      onMobileMenuToggle={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
+      isSidebarOpen={isSidebarOpen}
+      onToggleSidebar={() => setIsSidebarOpen(!isSidebarOpen)}
+      onNewSession={() => handleEditSession()}
+    />
+
+    <div className="flex flex-1 relative">
+      <div
+        className={`absolute left-0 top-0 h-full transition-all duration-200 ease-in-out ${
+          isSidebarOpen ? "w-77" : "w-0"
+        }`}
+      >
+        <Sidebar
+          isOpen={isSidebarOpen}
+          sessions={sessions}
+          currentSession={session}
+          onToggle={() => setIsSidebarOpen(!isSidebarOpen)}
+          onSelectSession={handleSelectSession}
+          onEditSession={handleEditSession}
+          onDeleteSession={handleDeleteSession}
+          isLoading={isLoading}
+          sessionRunStatuses={sessionRunStatuses}
+          activeSubMenuItem={activeSubMenuItem}
+          onSubMenuChange={setActiveSubMenuItem}
+          onStopSession={(sessionId: number) => {
+            if (sessionId === undefined || sessionId === null) return;
+            const id = Number(sessionId);
+            const ws = sessionSockets[id]?.socket;
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              ws.send(
+                JSON.stringify({
+                  type: "stop",
+                  reason: "Cancelled by user (sidebar)",
+                })
+              );
+              ws.close();
+            }
+            setSessionRunStatuses((prev) => ({
+              ...prev,
+              [id]: "stopped",
+            }));
+          }}
+        />
+      </div>
+
+      <div
+        className={`flex-1 transition-all -mr-4 duration-200 w-[200px] ${
+          isSidebarOpen ? "ml-64" : "ml-0"
+        }`}
+      >
+        {activeSubMenuItem === "mcp_servers" ? (
+          <div className="h-full overflow-hidden pl-4">
+            <McpServersList />
+          </div>
+        ) : activeSubMenuItem === "saved_plan" ? (
+          <div className="h-full overflow-hidden pl-4">
+            <PlanList
+              onTabChange={setActiveSubMenuItem}
+              onSelectSession={handleSelectSession}
+              onCreateSessionFromPlan={handleCreateSessionFromPlan}
+            />
+          </div>
+        ) : session && sessions.length > 0 ? (
+          <div className="pl-4">{chatViews}</div>
+        ) : (
+          <div className="flex items-center justify-center h-full text-secondary">
+            <Spin size="large" tip={"Loading..."} />
+          </div>
+        )}
+      </div>
+
+      <SessionEditor
+        session={editingSession}
+        isOpen={isEditorOpen}
+        onSave={handleSaveSession}
+        onCancel={() => {
+          setIsEditorOpen(false);
+          setEditingSession(undefined);
+        }}
+      />
+    </div>
+  </div>
+);
+```
+*Source: `frontend/src/components/views/manager.tsx` (lines 59-543)*
+
+### Chat Execution & WebSocket Loop
+The chat surface lazily loads the latest run, opens (or reuses) a WebSocket, and streams updates into the UI while tracking agent plan progress. This is the primary bridge between user intent and long-running backend agent activity.
+
+```tsx
+const loadSessionRun = async () => {
+  if (!session?.id || !user?.email) return null;
+  const response = await sessionAPI.getSessionRuns(session.id, user?.email);
+  const latestRun = response.runs[response.runs.length - 1];
+  return latestRun;
+};
+
+React.useEffect(() => {
+  if (session?.id) {
+    setLocalPlan(null);
+    const latestRun = await loadSessionRun();
+    if (latestRun) {
+      setCurrentRun(latestRun);
+      if (latestRun.id) {
+        setupWebSocket(latestRun.id, false, true);
+      }
+    }
+  }
+}, [session?.id, visible]);
+```
+*Source: `frontend/src/components/views/chat/chat.tsx` (lines 140-189)*
+
+### API Client Bridges to FastAPI
+Front-end API wrappers centralize REST calls so each page consumes typed methods instead of raw `fetch` invocations.
+
+```ts
+async listSessions(userId: string): Promise<Session[]> {
+  const response = await fetch(
+    `${this.getBaseUrl()}/sessions/?user_id=${userId}`,
+    { headers: this.getHeaders() }
+  );
+  const data = await response.json();
+  if (!data.status) throw new Error(data.message || "Failed to fetch sessions");
+  return data.data;
+}
+
+async getSessionRuns(sessionId: number, userId: string): Promise<SessionRuns> {
+  const response = await fetch(
+    `${this.getBaseUrl()}/sessions/${sessionId}/runs?user_id=${userId}`,
+    { headers: this.getHeaders() }
+  );
+  const data = await response.json();
+  if (!data.status) throw new Error(data.message || "Failed to fetch session runs");
+  return data.data;
+}
+```
+*Source: `frontend/src/components/views/api.ts` (lines 15-101)*
+
+Each method mirrors a FastAPI route:
+- `SessionAPI.listSessions` ⇄ `GET /sessions/` handled by `list_sessions`, returning all user sessions. *Backend source: `src/magentic_ui/backend/web/routes/sessions.py` (lines 13-18).* 
+- `SessionAPI.createSession` ⇄ `POST /sessions/`, which persists the session and immediately seeds a `Run` row for streaming. *Backend source: `src/magentic_ui/backend/web/routes/sessions.py` (lines 29-55).* 
+- `SessionAPI.updateSession` ⇄ `PUT /sessions/{session_id}`, allowing inline renames from the sidebar editor. *Backend source: `src/magentic_ui/backend/web/routes/sessions.py` (lines 58-77).* 
+- `SessionAPI.getSessionRuns` ⇄ `GET /sessions/{session_id}/runs` for chat history and plan metadata. *Backend source: `src/magentic_ui/backend/web/routes/sessions.py` (lines 89-167).* 
+- WebSocket commands issued from `ChatView` (`type: "start"`, `"stop"`, `"pause"`, `"resume"`) land in `@router.websocket("/runs/{run_id}")`, where the backend constructs tasks, spins up agent teams, and relays status back to the UI. *Backend source: `src/magentic_ui/backend/web/routes/ws.py` (lines 17-118).* 
+
+By following these pairings, newcomers can read a page/component, locate its API wrapper, and immediately jump into the FastAPI implementation to understand data contracts end-to-end.
 
 ---
 
