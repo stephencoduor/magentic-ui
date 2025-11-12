@@ -25,8 +25,11 @@
   - [Page-to-Backend Interaction Map](#page-to-backend-interaction-map)
 - [Backend Codebase](#backend-codebase)
   - [FastAPI Service Layer](#fastapi-service-layer)
+  - [Dependency Injection & Lifespan Hooks](#dependency-injection--lifespan-hooks)
+  - [Domain Models & Persistence](#domain-models--persistence)
+  - [Real-time Streaming & User Prompts](#real-time-streaming--user-prompts)
   - [Agent Orchestration](#agent-orchestration)
-  - [Persistence & Background Services](#persistence--background-services)
+  - [Backend ↔ Frontend Integration](#backend--frontend-integration)
 - [Deployment, CI/CD & Docker](#deployment-cicd--docker)
   - [Local Development Profiles](#local-development-profiles)
   - [Container Images](#container-images)
@@ -404,17 +407,22 @@ This matrix shows how each page or feature module maps to FastAPI handlers. Unde
 ## Backend Codebase
 
 ### FastAPI Service Layer
-The backend mounts a FastAPI application with a dedicated lifespan manager that orchestrates configuration loading, manager initialization, and cleanup.
+The FastAPI stack is intentionally explicit to help newcomers understand where lifecycle hooks, middleware, and routers are declared. The application factory wires up startup, shutdown, and modular routers in one place, so the backend can be embedded in tests or alternative deployments without additional glue code.
 
-```python title="src/magentic_ui/backend/web/app.py"
+```python title="src/magentic_ui/backend/web/app.py"{32-87}
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """Lifecycle manager for the FastAPI application."""
     try:
         config: dict[str, Any] = {}
         config_file = os.environ.get("_CONFIG")
         if config_file:
+            logger.info(f"Loading config from file: {config_file}")
             with open(config_file, "r") as f:
                 config = yaml.safe_load(f)
+        else:
+            logger.info("No config file provided, using defaults.")
+
         await init_managers(
             initializer.database_uri,
             initializer.config_dir,
@@ -425,41 +433,363 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             config,
             os.environ["RUN_WITHOUT_DOCKER"] == "True",
         )
-    finally:
-        ...
+        logger.info(
+            f"Application startup complete. Navigate to http://{os.environ.get('_HOST', '127.0.0.1')}:{os.environ.get('_PORT', '8081')}"
+        )
+    except Exception as e:
+        logger.error(f"Failed to initialize application: {str(e)}")
+        raise
+
+    yield
+
+    try:
+        logger.info("Cleaning up application resources...")
+        await cleanup_managers()
+        logger.info("Application shutdown complete")
+    except Exception as e:
+        logger.error(f"Error during shutdown: {str(e)}")
+
+app = FastAPI(lifespan=lifespan, debug=True)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        "http://localhost:8001",
+        "http://localhost:8081",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+api = FastAPI(
+    root_path="/api",
+    title="Magentic-UI API",
+    version=VERSION,
+    description="Magentic-UI is an application to interact with web agents.",
+    docs_url="/docs" if settings.API_DOCS else None,
+)
+api.include_router(sessions.router, prefix="/sessions", tags=["sessions"], responses={404: {"description": "Not found"}})
+api.include_router(plans.router, prefix="/plans", tags=["plans"], responses={404: {"description": "Not found"}})
 ```
 *Source: `src/magentic_ui/backend/web/app.py`*
 
-Routers under `routes/` expose domain-specific endpoints for sessions, runs, plan management, settings, and health checks. Static assets are mounted alongside the API to serve the compiled frontend and session artifacts.
+Key FastAPI concepts on display:
 
-### Agent Orchestration
-Agent team composition is centralized in `task_team.py`, enabling dynamic assembly of orchestrator, web surfer, coder, and guard agents based on runtime configuration.
+1. **Application lifespan:** `lifespan` encapsulates startup/shutdown work so that database connections and streaming managers are brought online exactly once per process. New FastAPI users can think of this as the async equivalent of Django’s `ready()` hook.
+2. **Sub-application routing:** The project mounts a secondary `FastAPI` instance at `/api`, keeping API schema metadata separate from static asset hosting. Static mounts at `/files` and `/` serve run artifacts and the compiled Gatsby site with the same process.
+3. **CORS middleware:** By explicitly listing development origins, the React SPA can call the API during local development without browser errors.
 
-```python title="src/magentic_ui/task_team.py"
-if magentic_ui_config.user_proxy_type in ["dummy", "metadata"]:
-    model_client_action_guard = get_model_client(
-        magentic_ui_config.model_client_configs.action_guard,
-        is_action_guard=True,
+### Dependency Injection & Lifespan Hooks
+FastAPI’s dependency system is used heavily to share initialized managers across request handlers. `deps.py` exposes async callables that raise typed HTTP errors whenever initialization is incomplete, which is friendlier for new contributors than allowing attribute errors to bubble up.
+
+```python title="src/magentic_ui/backend/web/deps.py"{21-127}
+@contextmanager
+def get_db_context():
+    if not _db_manager:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Database manager not initialized",
+        )
+    try:
+        yield _db_manager
+    except Exception as e:
+        logger.error(f"Database operation failed: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Database operation failed",
+        ) from e
+
+async def get_db() -> DatabaseManager:
+    if not _db_manager:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Database manager not initialized",
+        )
+    return _db_manager
+
+async def init_managers(
+    database_uri: str,
+    config_dir: Path,
+    app_root: Path,
+    internal_workspace_root: str,
+    external_workspace_root: str,
+    inside_docker: bool,
+    config: Dict[str, Any],
+    run_without_docker: bool,
+) -> None:
+    _db_manager = DatabaseManager(engine_uri=database_uri, base_dir=app_root)
+    _db_manager.initialize_database(auto_upgrade=settings.UPGRADE_DATABASE)
+    _websocket_manager = WebSocketManager(
+        db_manager=_db_manager,
+        internal_workspace_root=Path(internal_workspace_root),
+        external_workspace_root=Path(external_workspace_root),
+        inside_docker=inside_docker,
+        config=config,
+        run_without_docker=run_without_docker,
     )
-    approval_guard = ApprovalGuard(
-        input_func=always_yes_input,
-        default_approval=False,
-        model_client=model_client_action_guard,
-        config=ApprovalConfig(
-            approval_policy=approval_policy,
+```
+*Source: `src/magentic_ui/backend/web/deps.py`*
+
+Because dependencies are declared with `Depends(...)` inside routers, every endpoint automatically receives the same database session manager and connection orchestrator. When you write a new route, you can simply include `db=Depends(get_db)` and focus on business logic instead of connection plumbing.
+
+### Domain Models & Persistence
+All persistent records are expressed as [SQLModel](https://sqlmodel.tiangolo.com/) classes, which blend SQLAlchemy’s ORM with Pydantic validation. Reading the models is the quickest way to learn what data the frontend expects.
+
+```python title="src/magentic_ui/backend/datamodel/db.py"{38-144}
+class Message(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    created_at: datetime = Field(
+        sa_column=Column(DateTime(timezone=True), server_default=func.now()),
+    )
+    config: Union[MessageConfig, dict[str, Any]] = Field(
+        default_factory=lambda: MessageConfig(source="", content=""),
+        sa_column=Column(JSON),
+    )
+    session_id: Optional[int] = Field(
+        default=None,
+        sa_column=Column(Integer, ForeignKey("session.id", ondelete="CASCADE")),
+    )
+    run_id: Optional[int] = Field(
+        default=None,
+        sa_column=Column(Integer, ForeignKey("run.id", ondelete="CASCADE")),
+    )
+
+class Run(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    session_id: Optional[int] = Field(
+        default=None,
+        sa_column=Column(
+            Integer, ForeignKey("session.id", ondelete="CASCADE"), nullable=False
         ),
     )
-with ApprovalGuardContext.populate_context(approval_guard):
-    web_surfer = WebSurfer.from_config(websurfer_config)
+    status: RunStatus = Field(default=RunStatus.CREATED)
+    task: Union[MessageConfig, dict[str, Any]] = Field(
+        default_factory=lambda: MessageConfig(source="", content=""),
+        sa_column=Column(JSON),
+    )
+    team_result: Union[TeamResult, dict[str, Any]] = Field(
+        default=None, sa_column=Column(JSON)
+    )
+    input_request: Optional[dict[str, Any]] = Field(
+        default=None, sa_column=Column(JSON)
+    )
 ```
-*Source: `src/magentic_ui/task_team.py`*
+*Source: `src/magentic_ui/backend/datamodel/db.py`*
 
-The orchestrator coordinates turn-taking via group chats, leverages Playwright browser resources, and enforces approval guardrails for sensitive operations.
+Helpful mental models for beginners:
 
-### Persistence & Background Services
-- **Database:** SQLModel-backed storage initialized through `backend/database` manages session metadata and agent runs.
-- **File System:** Run directories mirror session IDs, allowing artifact download via the `/files` mount.
-- **Managers:** Initialization routines (database, connection pooling, team registry) live under `backend/teammanager` and `backend/utils` for reuse across CLI and API entry points.
+- **Session** represents the high-level chat workspace owned by a user.
+- **Run** captures one execution attempt within a session, including the task prompt, agent outputs, and input requests.
+- **Message** stores the streaming transcript. Foreign keys cascade deletes so you never need to manually clean up dependent rows.
+
+Under the hood, `DatabaseManager` centralizes engine creation, schema migrations, and utility helpers such as `reset_db` for local testing. Its constructor configures SQLite pragmas for concurrency, while `initialize_database` optionally triggers automatic migrations when the schema drifts.【F:src/magentic_ui/backend/database/db_manager.py†L16-L147】
+
+### Real-time Streaming & User Prompts
+The `/api/ws/runs/{run_id}` route streams task progress, input requests, and completion events to the browser. FastAPI’s WebSocket support pairs nicely with dependency injection so that the same database manager can be reused inside the socket loop.
+
+```python title="src/magentic_ui/backend/web/routes/ws.py"{17-118}
+@router.websocket("/runs/{run_id}")
+async def run_websocket(
+    websocket: WebSocket,
+    run_id: int,
+    ws_manager: WebSocketManager = Depends(get_websocket_manager),
+    db=Depends(get_db),
+):
+    run_response = db.get(Run, filters={"id": run_id}, return_json=False)
+    if not run_response.status or not run_response.data:
+        await websocket.close(code=4004, reason="Run not found")
+        return
+
+    connected = await ws_manager.connect(websocket, run_id)
+    if not connected:
+        await websocket.close(code=4002, reason="Failed to establish connection")
+        return
+
+    try:
+        while True:
+            raw_message = await websocket.receive_text()
+            message = json.loads(raw_message)
+            if message.get("type") == "start":
+                task = construct_task(query=message.get("task"), files=message.get("files"))
+                team_config = message.get("team_config")
+                settings_config = message.get("settings_config")
+                if task and team_config:
+                    asyncio.create_task(
+                        ws_manager.start_stream(run_id, task, team_config, settings_config)
+                    )
+```
+*Source: `src/magentic_ui/backend/web/routes/ws.py`*
+
+`WebSocketManager` handles the heavy lifting: it accepts browser connections, streams `TeamResult` updates from the agent runtime, persists transcript messages, and pauses runs while waiting for human input.
+
+```python title="src/magentic_ui/backend/web/managers/connection.py"{40-120,200-284}
+class WebSocketManager:
+    def __init__(
+        self,
+        db_manager: DatabaseManager,
+        internal_workspace_root: Path,
+        external_workspace_root: Path,
+        inside_docker: bool,
+        config: Dict[str, Any],
+        run_without_docker: bool,
+    ):
+        self._connections: Dict[int, WebSocket] = {}
+        self._input_responses: Dict[int, asyncio.Queue[str]] = {}
+        self._team_managers: Dict[int, TeamManager] = {}
+
+    async def start_stream(
+        self,
+        run_id: int,
+        task: str | ChatMessage | Sequence[ChatMessage] | None,
+        team_config: Dict[str, Any],
+        settings_config: Dict[str, Any],
+        user_settings: Settings | None = None,
+    ) -> None:
+        if run_id not in self._connections or run_id in self._closed_connections:
+            raise ValueError(f"No active connection for run {run_id}")
+
+        if run_id not in self._team_managers:
+            team_manager = TeamManager(
+                internal_workspace_root=self.internal_workspace_root,
+                external_workspace_root=self.external_workspace_root,
+                inside_docker=self.inside_docker,
+                config=self.config,
+                run_without_docker=self.run_without_docker,
+            )
+            self._team_managers[run_id] = team_manager
+
+        async for message in team_manager.run_stream(
+            task=task,
+            team_config=team_config,
+            state=state,
+            input_func=input_func,
+            cancellation_token=cancellation_token,
+            env_vars=env_vars,
+            settings_config=settings_config,
+            run=run,
+        ):
+            if (
+                cancellation_token.is_cancelled()
+                or run_id in self._closed_connections
+            ):
+                logger.info(
+                    f"Stream cancelled or connection closed for run {run_id}"
+                )
+                break
+
+            if isinstance(message, CheckpointEvent):
+                run = await self._get_run(run_id)
+                if run:
+                    run.state = message.state
+                    self.db_manager.upsert(run)
+                continue
+
+            formatted_message = self._format_message(message)
+            if formatted_message:
+                await self._send_message(run_id, formatted_message)
+                if isinstance(
+                    message,
+                    (
+                        TextMessage,
+                        MultiModalMessage,
+                        StopMessage,
+                        HandoffMessage,
+                        ToolCallRequestEvent,
+                        ToolCallExecutionEvent,
+                        LLMCallEventMessage,
+                    ),
+                ):
+                    await self._save_message(run_id, message)
+                elif isinstance(message, TeamResult):
+                    final_result = message.model_dump()
+```
+*Source: `src/magentic_ui/backend/web/managers/connection.py`*
+
+For newcomers, remember that WebSockets stay open until either side calls `close()`. The manager keeps cancellation tokens, run state, and per-connection queues so that user approvals (`input_response` messages) can be awaited without blocking the entire event loop.
+
+### Agent Orchestration
+`TeamManager` bridges the FastAPI surface area with the AutoGen-powered agent teams. It prepares workspace directories, loads the requested team configuration, and streams events back to the WebSocket manager.
+
+```python title="src/magentic_ui/backend/teammanager/teammanager.py"{49-115,174-199}
+class TeamManager:
+    """Manages team operations including loading configs and running teams"""
+
+    def __init__(
+        self,
+        internal_workspace_root: Path,
+        external_workspace_root: Path,
+        run_without_docker: bool,
+        inside_docker: bool = True,
+        config: dict[str, Any] = {},
+    ) -> None:
+        self.team: Team | None = None
+        self.internal_workspace_root = internal_workspace_root
+        self.external_workspace_root = external_workspace_root
+        self.inside_docker = inside_docker
+        self.run_without_docker = run_without_docker
+        self.config = config
+
+    def prepare_run_paths(self, run: Optional[Run] = None) -> RunPaths:
+        if run:
+            run_suffix = os.path.join(
+                "files",
+                "user",
+                str(run.user_id or "unknown_user"),
+                str(run.session_id or "unknown_session"),
+                str(run.id or "unknown_run"),
+            )
+        else:
+            run_suffix = os.path.join(
+                "files", "user", "unknown_user", "unknown_session", "unknown_run"
+            )
+        internal_run_dir = internal_workspace_root / Path(run_suffix)
+        external_run_dir = external_workspace_root / Path(run_suffix)
+        logger.info(f"Creating run dirs: {internal_run_dir} and {external_run_dir}")
+        if self.inside_docker:
+            internal_run_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            external_run_dir.mkdir(parents=True, exist_ok=True)
+
+        return RunPaths(
+            internal_root_dir=internal_workspace_root,
+            external_root_dir=external_workspace_root,
+            run_suffix=run_suffix,
+            internal_run_dir=internal_run_dir,
+            external_run_dir=external_run_dir,
+        )
+
+    async def _create_team(
+        self,
+        team_config: Union[str, Path, Dict[str, Any], ComponentModel],
+        state: Optional[Mapping[str, Any] | str] = None,
+        input_func: Optional[InputFuncType] = None,
+        env_vars: Optional[List[EnvironmentVariable]] = None,
+        settings_config: dict[str, Any] = {},
+        *,
+        paths: RunPaths,
+    ) -> tuple[Team, int, int]:
+        model_client_from_config_file = ModelClientConfigs(
+            orchestrator=self.config.get("orchestrator_client", None),
+            web_surfer=self.config.get("web_surfer_client", None),
+            coder=self.config.get("coder_client", None),
+        )
+```
+*Source: `src/magentic_ui/backend/teammanager/teammanager.py`*
+
+The orchestration layer is what turns a plain REST API into an autonomous agent playground. It manages AutoGen teams, passes along uploaded files, and returns `TeamResult` payloads that the UI renders as conversation updates.
+
+### Backend ↔ Frontend Integration
+Understanding how Gatsby pages call the API makes it easier to extend either side safely. The `SessionManager` component in the frontend relies on a thin REST client (`frontend/src/components/views/api.ts`) plus a dedicated WebSocket for live updates.
+
+| Frontend entry point | Backend dependency | Purpose |
+| -------------------- | ------------------ | ------- |
+| `SessionAPI.listSessions` fetches `GET /sessions/?user_id=...` to populate the left-hand session list when the workspace loads.【F:frontend/src/components/views/api.ts†L15-L26】【F:src/magentic_ui/backend/web/routes/sessions.py†L13-L27】 | `sessions.router` with `Depends(get_db)` filters records by `user_id`, guaranteeing users only see their own sessions.【F:src/magentic_ui/backend/web/routes/sessions.py†L13-L27】 | Load the initial workspace context. |
+| `SessionAPI.createSession` posts to `/sessions/` whenever a user spins up a new conversation from the UI toolbar.【F:frontend/src/components/views/api.ts†L41-L59】 | The backend creates a `Session`, then immediately seeds a `Run` row so the WebSocket has a target ID to stream into.【F:src/magentic_ui/backend/web/routes/sessions.py†L29-L55】 | Ensure every session has at least one executable run. |
+| `SessionManager.setupWebSocket` opens `ws://…/api/ws/runs/{runId}` as soon as a run is selected, matching the REST fetches for run history.【F:frontend/src/components/views/manager.tsx†L273-L316】【F:frontend/src/components/views/api.ts†L86-L101】 | The `run_websocket` endpoint validates the run via `get_db` and pipes messages through `WebSocketManager.start_stream`, which streams task state and saves transcripts.【F:src/magentic_ui/backend/web/routes/ws.py†L17-L118】【F:src/magentic_ui/backend/web/managers/connection.py†L115-L284】 | Drive the live transcript, tool events, and approval prompts shown in the conversation pane. |
+| When the user edits LLM settings or team composition, the UI reuses `TeamAPI` helpers that call `/teams` routes to fetch and persist templates.【F:frontend/src/components/views/api.ts†L132-L193】 | `teams.router` persists `Team` SQLModel objects so that AutoGen configurations are versioned per user and can be reused across sessions.【F:src/magentic_ui/backend/web/routes/teams.py†L1-L41】 | Keep orchestrator/coder/web-surfer setups in sync between the UI and backend runtime. |
+
+By tracing these flows, you can confidently add new controls to the Gatsby UI and immediately know which FastAPI router to extend or which SQLModel to adjust. Always cross-check line numbers in the repository before copying snippets into documentation or tooling scripts.
 
 ---
 
